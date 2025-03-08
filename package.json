@@ -9,6 +9,6 @@
     "dotenv": "^10.0.0"
   },
   "scripts": {
-    "start": "node.js"
+    "start": "node app.js"
   }
 }
