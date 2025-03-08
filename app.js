@@ -19,7 +19,6 @@ app.use(express.json());
 
 // ShipStation API credentials - should be in environment variables in production
 const SHIPSTATION_API_KEY = process.env.SHIPSTATION_API_KEY;
-const SHIPSTATION_API_SECRET = process.env.SHIPSTATION_API_SECRET;
 const SHIPSTATION_API_URL = 'https://api.shipstation.com/v2';
 
 // Carrier code mapping
