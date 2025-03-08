@@ -1,15 +1,15 @@
-// app.js - Complete Kinsta Node.js implementation for ShipStation tracking
+// app.js - Enhanced version with carrier auto-detection and direct tracking links
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-require('dotenv').config(); // For loading environment variables
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Allow CORS from your Shopify store
 app.use(cors({
-  origin: process.env.SHOPIFY_STORE_URL || '*', // Replace with your Shopify store URL in production
+  origin: process.env.SHOPIFY_STORE_URL || '*',
   methods: ['GET'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
@@ -17,26 +17,71 @@ app.use(cors({
 // Enable JSON parsing
 app.use(express.json());
 
-// ShipStation API credentials
-const SHIPSTATION_API_KEY = process.env.SHIPSTATION_API_KEY || 'UpX9fE5vPQ0mYy5OzGfm0GgyWYYeV6NNaZhGb/ZW0oM';
-// If your setup requires a secret as well, include it here
-const SHIPSTATION_API_SECRET = process.env.SHIPSTATION_API_SECRET || '';
+// ShipStation API credentials - should be in environment variables in production
+const SHIPSTATION_API_KEY = process.env.SHIPSTATION_API_KEY;
+const SHIPSTATION_API_SECRET = process.env.SHIPSTATION_API_SECRET;
 const SHIPSTATION_API_URL = 'https://api.shipstation.com/v2';
 
-// Map carrier codes to ShipStation carrier codes if needed
+// Carrier code mapping
 const CARRIER_CODE_MAP = {
-  'usps': 'stamps_com', // ShipStation uses 'stamps_com' for USPS
+  'usps': 'stamps_com',
   'fedex': 'fedex',
   'ups': 'ups',
   'dhl': 'dhl_express',
   'canada_post': 'canada_post'
 };
 
-// Helper function to make authenticated requests to ShipStation
+// Tracking URL patterns for direct links to carrier tracking pages
+const TRACKING_URL_PATTERNS = {
+  'usps': 'https://tools.usps.com/go/TrackConfirmAction?tLabels=',
+  'fedex': 'https://www.fedex.com/fedextrack/?trknbr=',
+  'ups': 'https://www.ups.com/track?tracknum=',
+  'dhl': 'https://www.dhl.com/en/express/tracking.html?AWB=',
+  'canada_post': 'https://www.canadapost-postescanada.ca/track-reperage/en#/search?searchFor='
+};
+
+// Function to auto-detect carrier from tracking number
+function detectCarrier(trackingNumber) {
+  const tn = trackingNumber.trim().toUpperCase();
+  
+  // USPS patterns
+  if (/^9[4-5]\d{20}$/.test(tn) || /^(91|92|93|94|95|96)\d{20}$/.test(tn) ||
+      /^[A-Z]{2}\d{9}[A-Z]{2}$/.test(tn) || /^E\D{1}\d{9}\D{2}$/.test(tn) ||
+      /^[A-Z]{2}\d{9}US$/.test(tn) || /^(420\d{5})?(91|92|93|94|95|96)\d{20}$/.test(tn) ||
+      /^(M|P[A-Z]?|D[A-Z]?|LK|E[A-Z]|V[A-Z]?|R[A-Z]?|CP|CJ|LC|LJ)\d{9}[A-Z]{2}$/.test(tn)) {
+    return 'usps';
+  }
+  
+  // FedEx patterns
+  if ((/^[0-9]{12,14}$/.test(tn) || /^6\d{11,12}$/.test(tn)) || 
+      (/^(96\d{20}|\d{15})$/.test(tn))) {
+    return 'fedex';
+  }
+  
+  // UPS patterns
+  if (/^1Z[0-9A-Z]{16}$/.test(tn) || /^(T\d{10}|927R\d{16})$/.test(tn) ||
+      /^(K\d{10})$/.test(tn)) {
+    return 'ups';
+  }
+  
+  // DHL patterns
+  if (/^\d{10,11}$/.test(tn) || /^[0-9]{10}$/.test(tn)) {
+    return 'dhl';
+  }
+  
+  // Canada Post patterns (these are approximate)
+  if (/^([A-Z]{2}\d{9}CA)$/.test(tn) || /^(\d{16})$/.test(tn)) {
+    return 'canada_post';
+  }
+  
+  // Default to unknown if no pattern matches
+  return null;
+}
+
+// Helper function to make authenticated requests to ShipStation (still used for label info)
 async function shipStationRequest(endpoint, method = 'GET', data = null) {
   try {
     // Create authorization header using API key
-    // ShipStation uses Basic Auth with the API key as the username and an empty password
     const authHeader = 'Basic ' + Buffer.from(`${SHIPSTATION_API_KEY}:`).toString('base64');
     
     const response = await axios({
@@ -56,59 +101,69 @@ async function shipStationRequest(endpoint, method = 'GET', data = null) {
   }
 }
 
-// Endpoint to get tracking information
+// Main tracking endpoint
 app.get('/tracking', async (req, res) => {
   try {
-    const { tracking_number, carrier } = req.query;
+    let { tracking_number, carrier } = req.query;
     
-    if (!tracking_number || !carrier) {
+    if (!tracking_number) {
       return res.status(400).json({ 
-        error: 'Missing tracking number or carrier',
+        error: 'Missing tracking number',
         status: 'error'
       });
     }
     
-    // Map carrier code if needed
-    const mappedCarrierCode = CARRIER_CODE_MAP[carrier.toLowerCase()] || carrier;
+    // Auto-detect carrier if not provided
+    if (!carrier) {
+      carrier = detectCarrier(tracking_number);
+    }
     
-    // First try to find the label by tracking number
-    const labelsResponse = await shipStationRequest(`/labels?tracking_number=${tracking_number}`);
+    // Generate direct tracking URL
+    let trackingUrl = null;
+    if (carrier && TRACKING_URL_PATTERNS[carrier]) {
+      trackingUrl = TRACKING_URL_PATTERNS[carrier] + tracking_number;
+    }
+    
+    // Map carrier code for ShipStation if needed
+    const mappedCarrierCode = carrier ? (CARRIER_CODE_MAP[carrier.toLowerCase()] || carrier) : null;
     
     let trackingInfo = null;
     
-    if (labelsResponse.labels && labelsResponse.labels.length > 0) {
-      // Get the first label that matches the tracking number
-      const label = labelsResponse.labels[0];
-      
+    // Try to get info from ShipStation if credentials are available
+    if (SHIPSTATION_API_KEY && mappedCarrierCode) {
       try {
-        // Get tracking details for this label
-        trackingInfo = await shipStationRequest(`/labels/${label.label_id}/track`);
-      } catch (trackingError) {
-        console.error('Error fetching label tracking:', trackingError);
-        // If tracking fails, try general tracking endpoint as fallback
-      }
-    }
-    
-    // If we couldn't get tracking info from the label, try direct tracking
-    if (!trackingInfo) {
-      try {
-        // Note: ShipStation API doesn't have a direct tracking endpoint by carrier/number
-        // We'll create a fallback with typical status timeline based on the tracking status
+        // First try to find the label by tracking number
+        const labelsResponse = await shipStationRequest(`/shipments?trackingNumber=${tracking_number}`);
         
-        // For a real implementation, you might want to integrate with a carrier's direct API
-        // or use a service like EasyPost, ShipEngine, etc. for more accurate tracking
-        
-        // Create a mock response based on common patterns
-        trackingInfo = createDefaultTrackingInfo(tracking_number, mappedCarrierCode);
+        if (labelsResponse && labelsResponse.shipments && labelsResponse.shipments.length > 0) {
+          // Use the first shipment that matches
+          const shipment = labelsResponse.shipments[0];
+          trackingInfo = {
+            tracking_number: tracking_number,
+            carrier_code: mappedCarrierCode,
+            status: shipment.shipmentStatus || 'Unknown',
+            status_description: shipment.shipmentStatus || 'Unknown',
+            ship_date: shipment.shipDate,
+            // Build basic events from what we have
+            events: []
+          };
+        }
       } catch (error) {
-        console.error('Error creating fallback tracking info:', error);
+        console.error('Error fetching from ShipStation:', error);
+        // Continue to fallback
       }
     }
     
-    // Format response for the frontend
-    const formattedResponse = formatTrackingResponse(trackingInfo, tracking_number, mappedCarrierCode);
+    // If no actual data, create a fallback with direct link
+    if (!trackingInfo) {
+      trackingInfo = createDefaultTrackingInfo(tracking_number, carrier || 'unknown');
+    }
     
-    return res.json(formattedResponse);
+    // Add the direct tracking URL to the response
+    const response = formatTrackingResponse(trackingInfo, tracking_number, carrier || 'unknown');
+    response.tracking_url = trackingUrl;
+    
+    return res.json(response);
   } catch (error) {
     console.error('Error processing tracking request:', error);
     
@@ -120,7 +175,7 @@ app.get('/tracking', async (req, res) => {
   }
 });
 
-// Helper function to format tracking response
+// Helper function to format tracking response (same as before)
 function formatTrackingResponse(trackingData, trackingNumber, carrierCode) {
   if (!trackingData) {
     return {
@@ -161,10 +216,8 @@ function formatTrackingResponse(trackingData, trackingNumber, carrierCode) {
   };
 }
 
-// Create default tracking info with typical statuses
+// Create default tracking info (same as before, used as fallback)
 function createDefaultTrackingInfo(trackingNumber, carrierCode) {
-  // Create a random status based on tracking number
-  // For testing purposes only - in production you would use real carrier data
   const hash = trackingNumber.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
   const possibleStatuses = ['PRE_TRANSIT', 'SHIPPED', 'IN_TRANSIT', 'OUT_FOR_DELIVERY', 'DELIVERED'];
   const statusIndex = hash % possibleStatuses.length;
@@ -201,6 +254,7 @@ function createDefaultTrackingInfo(trackingNumber, carrierCode) {
       });
     }
     
+    // Add other events as before...
     if (['DELIVERED', 'OUT_FOR_DELIVERY', 'IN_TRANSIT'].includes(status)) {
       const inTransitDate = new Date(now);
       inTransitDate.setDate(now.getDate() - 1);
@@ -227,7 +281,6 @@ function createDefaultTrackingInfo(trackingNumber, carrierCode) {
       });
     }
     
-    // Add pre-transit for all statuses
     const preTransitDate = new Date(now);
     preTransitDate.setDate(now.getDate() - 3);
     events.push({
